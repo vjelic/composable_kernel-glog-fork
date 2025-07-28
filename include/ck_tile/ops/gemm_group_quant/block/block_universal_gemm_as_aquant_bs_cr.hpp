@@ -156,6 +156,8 @@ struct AQuantBlockUniversalGemmAsBsCr : public BlockGemmQuantBase<Problem_>
 
         static constexpr index_t KPack      = WarpGemm::kKPerThread;
         static constexpr index_t KPerThread = KIterPerWarp * WarpGemm::kKPerThread;
+
+        static constexpr bool Preshuffle = Problem::Traits::Preshuffle;
     };
 
     public:
@@ -322,6 +324,7 @@ struct AQuantBlockUniversalGemmAsBsCr : public BlockGemmQuantBase<Problem_>
             static_assert(std::is_same_v<CDataType, typename CBlockTensor::DataType>,
                           "The CDataType as defined in traits should be the same as correspoinding "
                           "C block tensor data type!");
+            constexpr auto warp_size = get_warp_size();
 
             // hot loop:
             static_for<0, MIterPerWarp, 1>{}([&](auto mIter) {
@@ -354,82 +357,127 @@ struct AQuantBlockUniversalGemmAsBsCr : public BlockGemmQuantBase<Problem_>
                             }
                         });
 
-                        // Need to multiply aquant with accumulated C
-                        //
-                        // The accumulated C tile has the standard distribution. For example
-                        // lane 0 holds elements [0,0], [1,0], [2,0], [3,0], [8,0], [9,0],
-                        // [10,0], [11,0], [16,0], [17,0], [18,0], [19,0], [24,0], [25,0],
-                        // [26,0], [27,0].
-                        //
-                        // These elements are in different rows, need to get the scale value
-                        // for the corresponding row.
-                        // Based on aquant's tile distribution, it can be inferred which
-                        // lane holds the relevant scale. For example, the scales corresponding
-                        // to the 16 elements held by lane 0 are held by lanes 0, 1, 2, 3, 8, 9,
-                        // 10, 11, 16, 17, 18, 19, 24, 25, 26, 27 respectively.
-                        //
-                        // These scales can be obtained using __builtin_amdgcn_ds_bpermute.
+                        if constexpr(Traits::Preshuffle)
+                        {
+                            constexpr auto tbuf_offset =
+                                number<typename CBlockTensor::ThreadTensorDesc{}.calculate_offset(
+                                           merge_sequences(sequence<mIter, nIter>{},
+                                                           c_warp_y_index_zeros)) /
+                                       CBlockTensor::PackedSize>{};
+                            constexpr uint32_t kTileRowsPerThread = 4;
 
-                        // MIters per warp
-                        constexpr index_t mIters_per_warp = get_warp_size() / WarpGemm::kM;
+                            static_for<0, WarpGemm::kM * WarpGemm::kN / warp_size, 1>{}(
+                                [&](auto c_row) {
+                                    auto pull_from_lane =
+                                        ((threadIdx.x & (warp_size - 1)) / Traits::WarpGemm::kN *
+                                             kTileRowsPerThread +
+                                         c_row) *
+                                            Traits::QScalesPerBlockRow +
+                                        kQScale;
+                                    auto& scale_reg = aq_block_tensor.get_thread_buffer()[mIter];
+                                    uint32_t scale_reg_dword;
 
-                        // Reg block offset based on mIter
-                        constexpr index_t reg_block_offset =
-                            ((mIter / mIters_per_warp) * Traits::AQPerBlock);
+                                    if constexpr(std::is_same_v<AQDataType, float>)
+                                    {
+                                        scale_reg_dword = ck_tile::bit_cast<uint32_t>(scale_reg);
+                                    }
+                                    else
+                                    {
+                                        scale_reg_dword = static_cast<uint32_t>(scale_reg);
+                                    }
 
-                        constexpr index_t lane_base_offset =
-                            (mIter % mIters_per_warp) * WarpGemm::kM;
+                                    int gathered_scale_reg = __builtin_amdgcn_ds_bpermute(
+                                        pull_from_lane << 2,
+                                        __builtin_bit_cast(int, scale_reg_dword));
 
-                        // Scale tensor offset along K
-                        constexpr index_t src_reg_offset = reg_block_offset + kQScale;
+                                    float scale_reg_f = Base::cvt_scale_to_fp32(gathered_scale_reg);
 
-                        constexpr uint32_t kTileRows        = 4;
-                        constexpr uint32_t kTiledCMsPerWarp = WarpGemm::kCMLane * kTileRows;
+                                    c_block_tensor.get_thread_buffer()[tbuf_offset + c_row] +=
+                                        (c_warp_tensor.get_thread_buffer()[c_row] * scale_reg_f *
+                                         kA_cvt_scale * kB_cvt_scale);
+                                });
+                        }
+                        else
+                        {
+                            // Need to multiply aquant with accumulated C
+                            //
+                            // The accumulated C tile has the standard distribution. For example
+                            // lane 0 holds elements [0,0], [1,0], [2,0], [3,0], [8,0], [9,0],
+                            // [10,0], [11,0], [16,0], [17,0], [18,0], [19,0], [24,0], [25,0],
+                            // [26,0], [27,0].
+                            //
+                            // These elements are in different rows, need to get the scale value
+                            // for the corresponding row.
+                            // Based on aquant's tile distribution, it can be inferred which
+                            // lane holds the relevant scale. For example, the scales corresponding
+                            // to the 16 elements held by lane 0 are held by lanes 0, 1, 2, 3, 8, 9,
+                            // 10, 11, 16, 17, 18, 19, 24, 25, 26, 27 respectively.
+                            //
+                            // These scales can be obtained using __builtin_amdgcn_ds_bpermute.
 
-                        constexpr auto tbuf_offset =
-                            number<typename CBlockTensor::ThreadTensorDesc{}.calculate_offset(
-                                       merge_sequences(sequence<mIter, nIter>{},
-                                                       c_warp_y_index_zeros)) /
-                                   CBlockTensor::PackedSize>{};
+                            // MIters per warp
+                            constexpr index_t mIters_per_warp = get_warp_size() / WarpGemm::kM;
 
-                        static_for<0, WarpGemm::kM, WarpGemm::kCMLane>{}([&](auto c_row) {
-                            // Multiply by 4 because output is stored in tiles of 4
-                            // x CNLane
-                            constexpr uint32_t row_base =
-                                ((c_row / kTiledCMsPerWarp) * kTiledCMsPerWarp) +
-                                ((c_row % kTiledCMsPerWarp) / WarpGemm::kCMLane);
+                            // Reg block offset based on mIter
+                            constexpr index_t reg_block_offset =
+                                ((mIter / mIters_per_warp) * Traits::AQPerBlock);
 
-                            constexpr uint32_t reg_offset_for_row_data = c_row / WarpGemm::kCMLane;
+                            constexpr index_t lane_base_offset =
+                                (mIter % mIters_per_warp) * WarpGemm::kM;
 
-                            // Lane index to source scale from
-                            uint32_t src_lane_idx = lane_base_offset + row_base +
-                                                    (__lane_id() / WarpGemm::kN * kTileRows);
+                            // Scale tensor offset along K
+                            constexpr index_t src_reg_offset = reg_block_offset + kQScale;
 
-                            // Directly index into thread buffer corresponding to
-                            // desired row coefficient
-                            auto& scale_reg = aq_block_tensor.get_thread_buffer()[src_reg_offset];
-                            uint32_t scale_reg_dword;
+                            constexpr uint32_t kTileRows        = 4;
+                            constexpr uint32_t kTiledCMsPerWarp = WarpGemm::kCMLane * kTileRows;
 
-                            if constexpr(std::is_same_v<AQDataType, float>)
-                            {
-                                scale_reg_dword = ck_tile::bit_cast<uint32_t>(scale_reg);
-                            }
-                            else
-                            {
-                                scale_reg_dword = static_cast<uint32_t>(scale_reg);
-                            }
+                            constexpr auto tbuf_offset =
+                                number<typename CBlockTensor::ThreadTensorDesc{}.calculate_offset(
+                                           merge_sequences(sequence<mIter, nIter>{},
+                                                           c_warp_y_index_zeros)) /
+                                       CBlockTensor::PackedSize>{};
 
-                            // Pull scale data across lanes
-                            int gathered_scale_reg = __builtin_amdgcn_ds_bpermute(
-                                src_lane_idx * 4, __builtin_bit_cast(int, scale_reg_dword));
+                            static_for<0, WarpGemm::kM, WarpGemm::kCMLane>{}([&](auto c_row) {
+                                // Multiply by 4 because output is stored in tiles of 4
+                                // x CNLane
+                                constexpr uint32_t row_base =
+                                    ((c_row / kTiledCMsPerWarp) * kTiledCMsPerWarp) +
+                                    ((c_row % kTiledCMsPerWarp) / WarpGemm::kCMLane);
 
-                            float scale_reg_f = Base::cvt_scale_to_fp32(gathered_scale_reg);
+                                constexpr uint32_t reg_offset_for_row_data =
+                                    c_row / WarpGemm::kCMLane;
 
-                            c_block_tensor
-                                .get_thread_buffer()[tbuf_offset + reg_offset_for_row_data] +=
-                                (c_warp_tensor.get_thread_buffer()[reg_offset_for_row_data] *
-                                 scale_reg_f * kA_cvt_scale * kB_cvt_scale);
-                        });
+                                // Lane index to source scale from
+                                uint32_t src_lane_idx = lane_base_offset + row_base +
+                                                        (__lane_id() / WarpGemm::kN * kTileRows);
+
+                                // Directly index into thread buffer corresponding to
+                                // desired row coefficient
+                                auto& scale_reg =
+                                    aq_block_tensor.get_thread_buffer()[src_reg_offset];
+                                uint32_t scale_reg_dword;
+
+                                if constexpr(std::is_same_v<AQDataType, float>)
+                                {
+                                    scale_reg_dword = ck_tile::bit_cast<uint32_t>(scale_reg);
+                                }
+                                else
+                                {
+                                    scale_reg_dword = static_cast<uint32_t>(scale_reg);
+                                }
+
+                                // Pull scale data across lanes
+                                int gathered_scale_reg = __builtin_amdgcn_ds_bpermute(
+                                    src_lane_idx * 4, __builtin_bit_cast(int, scale_reg_dword));
+
+                                float scale_reg_f = Base::cvt_scale_to_fp32(gathered_scale_reg);
+
+                                c_block_tensor
+                                    .get_thread_buffer()[tbuf_offset + reg_offset_for_row_data] +=
+                                    (c_warp_tensor.get_thread_buffer()[reg_offset_for_row_data] *
+                                     scale_reg_f * kA_cvt_scale * kB_cvt_scale);
+                            });
+                        }
                     });
                 });
             });
