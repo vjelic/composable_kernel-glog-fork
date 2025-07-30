@@ -67,18 +67,17 @@ class TestCkTileReduce : public ::testing::Test
 
         // Generic helper to create tuple from vector based on compile-time size
         auto make_shape_tuple = []<std::size_t N>(const std::vector<ck_tile::index_t>& vec) {
-            return [&vec]<std::size_t... I>(std::index_sequence<I...>)
-            {
+            return [&vec]<std::size_t... I>(std::index_sequence<I...>) {
                 return ck_tile::make_tuple(vec[I]...);
-            }
-            (std::make_index_sequence<N>{});
+            }(std::make_index_sequence<N>{});
         };
 
         auto input_shape_tuple   = make_shape_tuple.template operator()<InputDim>(input_shape);
         auto input_strides_tuple = make_shape_tuple.template operator()<InputDim>(input_strides);
 
         if(!Kernel::IsSupportedArgument(
-               output_shape[output_shape.size() - 1])) // output tensor's continuous dimension
+               output_shape[output_shape.size() - 1],
+               input_strides_tuple)) // output tensor's continuous dimension
         {
             throw std::runtime_error("Wrong! Arguments not supported!\n");
         }
