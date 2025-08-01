@@ -24,6 +24,7 @@ struct BaseGemmPipelineAgBgCrCompV3
     static constexpr index_t PrefillStages    = 1;
     static constexpr index_t GlobalBufferNum  = 1;
     static constexpr bool UsePersistentKernel = Problem::Traits::UsePersistentKernel;
+    static constexpr bool UseReductionForSplitK = Problem::Traits::UseReductionForSplitK;
 
     CK_TILE_HOST_DEVICE static constexpr auto TransposeC() { return Problem::TransposeC; }
 
